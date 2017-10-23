@@ -1,4 +1,4 @@
-package: github.com/timescale/prometheus-timescaledb-adapter
+package: github.com/timescale/prometheus-postgresql-adapter
 import:
 - package: github.com/prometheus/common
   subpackages:
@@ -13,5 +13,4 @@ import:
   - proto
 - package: github.com/golang/snappy
 - package: github.com/prometheus/client_golang
-  version: ^0.8.0
 - package: github.com/lib/pq

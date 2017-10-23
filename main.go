@@ -18,17 +18,21 @@ package main
 // documentation/examples/remote_storage/remote_storage_adapter/main.go
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 	"github.com/timescale/prometheus-postgresql-adapter/postgresql"
@@ -72,13 +76,53 @@ var (
 		},
 		[]string{"remote"},
 	)
+	durationOpts = prometheus.HistogramOpts{
+		Name:    "request_duration_seconds",
+		Help:    "A histogram of latencies for requests.",
+		Buckets: []float64{0.1, 0.2, 0.5, 1, 2.5, 5},
+	}
+	readVec  *prometheus.HistogramVec
+	writeVec *prometheus.HistogramVec
 )
 
+type bucket []float64
+
+func (b *bucket) String() string {
+	return fmt.Sprint(*b)
+}
+
+func (b *bucket) Set(value string) error {
+	if len(*b) > 0 {
+		return errors.New("bucket flag already set")
+	}
+	for _, dt := range strings.Split(value, ",") {
+		duration, err := strconv.ParseFloat(dt, 64)
+		if err != nil {
+			return err
+		}
+		*b = append(*b, duration)
+	}
+	return nil
+}
+
+var bucketFlag bucket
+
 func init() {
+	flag.Var(&bucketFlag, "buckets", "Comma-separated list of intervals to bucketize response times")
+	if len(bucketFlag) > 0 {
+		durationOpts.Buckets = bucketFlag
+	}
+	durationOpts.ConstLabels = prometheus.Labels{"handler": "read"}
+	readVec = prometheus.NewHistogramVec(durationOpts, []string{})
+	durationOpts.ConstLabels = prometheus.Labels{"handler": "write"}
+	writeVec = prometheus.NewHistogramVec(durationOpts, []string{})
+
 	prometheus.MustRegister(receivedSamples)
 	prometheus.MustRegister(sentSamples)
 	prometheus.MustRegister(failedSamples)
 	prometheus.MustRegister(sentBatchDuration)
+	prometheus.MustRegister(readVec)
+	prometheus.MustRegister(writeVec)
 }
 
 func main() {
@@ -129,7 +173,7 @@ func buildClients(cfg *config) ([]writer, []reader) {
 }
 
 func serve(addr string, writers []writer, readers []reader) error {
-	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
+	write := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -161,8 +205,9 @@ func serve(addr string, writers []writer, readers []reader) error {
 		}
 		wg.Wait()
 	})
+	http.HandleFunc("/write", promhttp.InstrumentHandlerDuration(writeVec, write))
 
-	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
+	read := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -211,6 +256,7 @@ func serve(addr string, writers []writer, readers []reader) error {
 			return
 		}
 	})
+	http.HandleFunc("/read", promhttp.InstrumentHandlerDuration(readVec, read))
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		// Only supports one reader at this point
